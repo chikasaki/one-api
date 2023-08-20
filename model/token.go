@@ -5,6 +5,15 @@ import (
 	"fmt"
 	"gorm.io/gorm"
 	"one-api/common"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var (
+	cachedTokenQuotas      sync.Map
+	cachedTokenQuotasLock  sync.Mutex
+	toCachedTokenQuotaChan chan *Token
 )
 
 type Token struct {
@@ -224,4 +233,95 @@ func PostConsumeTokenQuota(tokenId int, quota int) (err error) {
 		}
 	}
 	return nil
+}
+
+func offlineUpdateTokenQuota() {
+	// initialize
+	toCachedTokenQuotaChan = make(chan *Token, 1000)
+	timer := time.NewTicker(time.Millisecond * 500)
+	go func() {
+		for range timer.C {
+			toUpdatedTokenQuotas := make([]Token, 0, 100)
+			cachedTokenQuotasLock.Lock()
+			cachedTokenQuotas.Range(func(key, value any) bool {
+				toUpdatedTokenQuotas = append(toUpdatedTokenQuotas, Token{
+					Id:        key.(int),
+					UsedQuota: int(*value.(*int32)),
+				})
+				return true
+			})
+			//refresh cachedTokenQuotas to avoid memory leak
+			for _, token := range toUpdatedTokenQuotas {
+				cachedTokenQuotas.Delete(token.Id)
+			}
+			cachedTokenQuotasLock.Unlock()
+
+			fail := batchConsumeTokenQuota(toUpdatedTokenQuotas)
+
+			if len(fail) != 0 {
+				cachedTokenQuotasLock.Lock()
+				for _, token := range fail {
+					usedQuota := token.UsedQuota
+					cachedTokenQuotas.Store(token.Id, &usedQuota)
+				}
+				cachedTokenQuotasLock.Unlock()
+			}
+		}
+	}()
+	go func() {
+		for toCachedToken := range toCachedTokenQuotaChan {
+			cachedTokenQuotasLock.Lock()
+			cachedTokenQuota, ok := cachedTokenQuotas.Load(toCachedToken.Id)
+			if !ok {
+				// must lock and check again
+				cachedTokenQuotas.Store(toCachedToken.Id, new(int32))
+			}
+			atomic.AddInt32(cachedTokenQuota.(*int32), int32(toCachedToken.UsedQuota))
+			cachedTokenQuotasLock.Unlock()
+		}
+	}()
+}
+
+func batchConsumeTokenQuota(tokens []Token) (fail []Token) {
+	defer func() {
+		if len(fail) != 0 {
+			common.SysError(fmt.Sprintf("batchConsumeTokenQuota fail:%d", len(fail)))
+		}
+	}()
+	failChan := make(chan Token, 10)
+	completeChan := make(chan struct{})
+	go func() {
+		for token := range failChan {
+			fail = append(fail, token)
+		}
+		close(completeChan)
+	}()
+	wg := sync.WaitGroup{}
+	batch := 10
+	for i := 0; i < len(tokens); i += batch {
+		j := i + batch
+		if j > len(tokens) {
+			j = len(tokens)
+		}
+
+		for _, token := range tokens[i:j] {
+			wg.Add(1)
+			go func(token Token) {
+				defer wg.Done()
+				var err error
+				if token.UsedQuota > 0 {
+					err = DecreaseTokenQuota(token.Id, token.UsedQuota)
+				} else if token.UsedQuota < 0 {
+					err = IncreaseTokenQuota(token.Id, -token.UsedQuota)
+				}
+				if err != nil {
+					common.SysError(fmt.Sprintf("update token:%+v fail, err:%+v", token, err))
+					failChan <- token
+				}
+			}(token)
+		}
+	}
+	close(failChan)
+	<-completeChan
+	return fail
 }
